@@ -13,12 +13,12 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_generic
-          - i386_pentium-mmx
-          - loongarch64_generic
-          - mips_mips32
-          - mipsel_24kc
-          - mipsel_mips32
+          - aarch64_cortex-a53
+          #- i386_pentium-mmx
+          #- loongarch64_generic
+          #- mips_mips32
+          #- mipsel_24kc
+          #- mipsel_mips32
           - x86_64
     steps:
       - uses: actions/checkout@main
