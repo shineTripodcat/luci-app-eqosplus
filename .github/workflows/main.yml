@@ -1,48 +1,130 @@
-name: Build
+name: Build and Release luci-app-eqosplus
 
 on:
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: '是否创建Release'
+        required: true
+        default: 'false'
   push:
-    tags:
-      - v*
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch:
+        arch: 
           - aarch64_cortex-a53
-          #- i386_pentium-mmx
-          #- loongarch64_generic
-          #- mips_mips32
-          #- mipsel_24kc
-          #- mipsel_mips32
           - x86_64
+        include:
+          - arch: aarch64_cortex-a53
+            target: armsr/armv8
+            output_path: bin/packages/armsr/armv8/base
+          - arch: x86_64
+            target: x86/64
+            output_path: bin/packages/x86_64/base
+
     steps:
-      - uses: actions/checkout@main
+      # ========== 环境初始化 ==========
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
+          submodules: recursive
           fetch-depth: 0
-      - name: Building packages
-        uses: sbwml/openwrt-gh-action-sdk@go1.24
-        env:
-          ARCH: ${{ matrix.arch }}-openwrt-24.10
-          FEEDNAME: packages_ci
-          PACKAGES: luci-app-eqosplus
-          NO_REFRESH_CHECK: true
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Setup workspace
+        run: |
+          sudo mkdir -p $GITHUB_WORKSPACE/package
+          sudo chmod -R 777 $GITHUB_WORKSPACE
+          mkdir -p package/luci-app-eqosplus
+
+      # ========== 依赖管理 ==========
+      - name: Cache dependencies
+        uses: actions/cache@v3
         with:
-          name: ${{ matrix.arch }}
-          path: bin/packages/${{ matrix.arch }}/packages_ci/*.ipk
+          path: |
+            dl/
+            build_dir/
+          key: ${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('feeds.conf.default') }}
 
-      - name: Upload packages
+      - name: Setup OpenWrt SDK
+        uses: docker://openwrtorg/sdk:24.10
+        with:
+          arch: ${{ matrix.arch }}
+
+      # ========== 源码管理 ==========
+      - name: Clone specific commit
+        run: |
+          git clone -b main --depth=1 \
+            https://github.com/shineTripodcat/luci-app-eqosplus.git \
+            package/luci-app-eqosplus
+          cd package/luci-app-eqosplus
+          git reset --hard 8b3ea69
+
+      # ========== 构建配置 ==========
+      - name: Generate config
+        run: |
+          cat > .config <<EOF
+          CONFIG_TARGET_${{ matrix.target }}=y
+          CONFIG_PACKAGE_luci-app-eqosplus=y
+          CONFIG_PACKAGE_luci-i18n-eqosplus-zh-cn=y
+          EOF
+
+      # ========== 编译过程 ==========
+      - name: Build package
+        run: |
+          make defconfig
+          make package/luci-app-eqosplus/{clean,compile} V=s -j$(nproc)
+
+      # ========== 时间戳获取 ==========
+      - name: Get build time
+        id: get-date
+        run: echo "date=$(date +'%%Y-%%m-%%d %%H:%%M:%%S %%Z')" >> $GITHUB_OUTPUT
+
+      # ========== 产物验证 ==========
+      - name: Verify artifacts
+        run: |
+          find ${{ matrix.output_path }} -name '*.ipk' -ls
+          [ $(ls ${{ matrix.output_path }}/*.ipk | wc -l) -gt 0 ] || exit 1
+
+      # ========== 双通道上传 ==========
+      - name: Upload to Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ipk-${{ matrix.arch }}
+          path: ${{ matrix.output_path }}/*.ipk
+          retention-days: 7
+
+      - name: Publish to GitHub Release
         uses: ncipollo/release-action@v1
+        if: success() && (github.event_name == 'push' || github.event.inputs.create_release == 'true')
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           allowUpdates: true
           replacesArtifacts: true
-          artifacts: "bin/packages/${{ matrix.arch }}/packages_ci/*.ipk"
+          artifacts: ${{ matrix.output_path }}/*.ipk
+          tag: ${{ github.ref_name || 'nightly-build' }}
+          name: "Build ${{ github.run_number }} (${{ matrix.arch }})"
+          body: |
+            🚀 Auto-built OpenWrt Package | ${{ github.sha }}
+            - 架构: ${{ matrix.arch }}
+            - 构建时间: ${{ steps.get-date.outputs.date }}
+            - 包含组件:
+              - luci-app-eqosplus
+              - luci-i18n-eqosplus-zh-cn
+
+      # ========== 错误处理 ==========
+      - name: Debug on failure
+        if: failure()
+        run: |
+          sudo apt-get install -y tree  # 确保tree命令可用
+          make V=s > build.log 2>&1 || true
+          grep -i error build.log || echo "No errors found"
+          tree -L 3 package/luci-app-eqosplus
